@@ -1,8 +1,14 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import os
 import argparse
 
 import torch
-from auto_gptq.utils import Perplexity
+# from auto_gptq.utils import Perplexity
+from utils import Perplexity
 from transformers import AutoTokenizer
 
 if __name__ == "__main__":
@@ -38,13 +44,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_fast_tokenizer", action="store_true", help="Wheter to use fast tokenizer")
     parser.add_argument("--trust_remote_code", action="store_true", help="Whether to use remote code")
     parser.add_argument("--disable_exllama", action="store_true", help="Whether to use disable exllama kernel")
+    parser.add_argument("--mx", action="store_true", help="Whether to use microxcaling")
+    parser.add_argument("--mx_format", type=str, default="int8", help="MX element format")
+    parser.add_argument("--no_tqdm", action="store_true", help="Whether to disable tqdm")
+    parser.add_argument("--mx_block_size", type=int, default=32, help="MX block size")
     args = parser.parse_args()
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=args.use_fast_tokenizer)
-    if not tokenizer.pad_token_id:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     max_memory = dict()
     if args.per_gpu_max_memory is not None and args.per_gpu_max_memory > 0:
@@ -66,7 +72,7 @@ if __name__ == "__main__":
         model = AutoGPTQForCausalLM.from_quantized(
             args.model_name,
             low_cpu_mem_usage=True,
-            device_map="auto",
+            device_map=device,
             max_memory=max_memory,
             model_basename=args.model_basename,
             use_safetensors=True,
@@ -76,16 +82,53 @@ if __name__ == "__main__":
             disable_exllama=args.disable_exllama
         )
     else:
-        from transformers import AutoModelForCausalLM
+        if (args.mx):
+            from mx import mx_mapping
+            from mx import finalize_mx_specs
+            mx_specs = {
+            'w_elem_format': args.mx_format, #'int8',#'fp6_e3m2',
+            'a_elem_format': args.mx_format, #'int8',#'fp6_e3m2',
+            'block_size': args.mx_block_size, #32,
+            'bfloat': 16,
+            'custom_cuda': True,
+            # For quantization-aware finetuning, do backward pass in FP32
+            'quantize_backprop': False,
+            }
+            mx_specs = finalize_mx_specs(mx_specs)
+            mx_mapping.inject_pyt_ops(mx_specs)
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            max_memory=max_memory,
-            torch_dtype=torch.float16,
-            trust_remote_code=args.trust_remote_code
-        )
+        # args.model_name includes mamba
+        is_mamba = "mamba" in args.model_name
+        if is_mamba:
+            tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=args.use_fast_tokenizer)
+        
+        if not tokenizer.pad_token_id:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        if not tokenizer.bos_token_id:
+            tokenizer.bos_token_id = tokenizer.eos_token_id
+
+
+        if is_mamba:
+            from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+            model = MambaLMHeadModel.from_pretrained(args.model_name, device="auto", dtype=torch.float16)
+        else:
+            from transformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                max_memory=max_memory,
+                torch_dtype=(torch.float32 if args.mx else torch.float16),
+                trust_remote_code=args.trust_remote_code,
+                # attn_implementation= (None if args.mx else "flash_attention_2"),
+            )
 
     ppl = Perplexity(model, tokenizer, args.dataset_path, args.dataset_name, args.split, args.text_column)
-    ppl.calculate_perplexity(args.n_ctx, args.n_batch)
+    ppl_arr = ppl.calculate_perplexity(args.n_ctx, args.n_batch)#, args.no_tqdm)
+    
+    avg_ppl = sum(ppl_arr) / len(ppl_arr)
+    avg_ppl = round(avg_ppl, 4)
+
+    print(avg_ppl)
